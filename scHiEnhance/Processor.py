@@ -142,7 +142,7 @@ if __name__ == "__main__":
         help="root directory where high resolution intrachromosomal Hi-C interaction .hic profile are stored"
     )
     parser.add_argument(
-        '--output', type=str, required=True,
+        '--outdir', type=str, required=True,
             help="output directory to write preprocessing results to"
     )
     parser.add_argument(
