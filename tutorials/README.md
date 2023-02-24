@@ -24,3 +24,14 @@ python POE_VAE.py -dir outdir/
 ```
 python Reconstruction.py -dir outdir/
 ```
+#### 5. Visualization
+##### 5.1 Clsutering
+```
+python Visualization.py -dir outdir/ -cell_type cell_label_path/
+```
+<div align=center><img width="650" height="400" src="https://github.com/AmyTanJ/scHiEnhance/blob/main/figs/10kb_Dip-C_clustering_result.png"/></div>
+
+##### 5.2 Generation
+```
+python POE_generation.py -dir outdir/ -gen_epoch 5 -gen_num 10
+```
