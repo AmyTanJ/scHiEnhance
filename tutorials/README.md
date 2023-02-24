@@ -3,6 +3,9 @@
 ## scHiEnhance on Dip-C Tan et al. Cell mousebrain dataset
 
 ### Preparation
+```
+git clone https://github.com/AmyTanJ/scHiEnhance.git
+```
 #### Download input files
 Download the Dip-C data from https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE162511
 
