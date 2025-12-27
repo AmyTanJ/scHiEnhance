@@ -7,36 +7,44 @@ import h5py
 import hicstraw
 from tqdm import tqdm
 
-def carn_divider(hic, cell_num, chr_num, gi, chunk=200, stride=200, bound=201, padding=True):
-    divide(hic, cell_num, chr_num, gi, chunk, stride, bound, padding)
+def carn_divider(hic, cell_num, chr_num, gi, chunk=200, stride=190, padding=True):
+    divide(hic, cell_num, chr_num, gi, chunk_size=chunk, stride=stride, padding=padding)
 
-def divide(mat, cell_num, chr_num, gi, chunk_size=200, stride=200, bound=201, padding=True, verbose=False):
+
+def divide(mat, cell_num, chr_num, gi, chunk_size=200, stride=190, padding=True, verbose=False):
     """
-    Dividing method.
+    Divide scHi-C contact map into diagonal patches.
+    Each patch corresponds to a local window along the diagonal.
     """
-    result = []
     size = mat.shape[0]
-    if (stride < chunk_size and padding):
+    if padding and stride < chunk_size:
         pad_len = (chunk_size - stride) // 2
-        mat = np.pad(mat, ((pad_len, pad_len), (pad_len, pad_len)), 'constant')
-    # mat's shape changed, update!
+        mat = np.pad(mat, ((pad_len, pad_len), (pad_len, pad_len)), mode="constant")
     height, width = mat.shape
-    assert height == width, 'Now, we just assumed matrix is squared!'
+    assert height == width, "Hi-C matrix must be square"
+
     for i in range(0, height, stride):
-        for j in range(0, width, stride):
-            if abs(i - j) <= bound and i + chunk_size < height and j + chunk_size < width and i>=j:
-                subImage = mat[i:i + chunk_size, j:j + chunk_size]
-                subImage = subImage.astype(np.float32)
-                subImage=torch.from_numpy(subImage)
-                subImage = subImage.reshape(200*200)
-                sample = gi.create_group('{0}_{1}'.format(i, j))
-                sample.create_dataset('img', data = subImage, compression="gzip")
-                strList = [cell_num, chr_num, size, i, j]
-                asciiList = [repr(n).encode("ascii", "ignore") for n in strList]
-                sample.create_dataset('label', data = asciiList)
-    if verbose: print(
-        f'[Chr{chr_str}] Deviding HiC matrix ({size}x{size}) into {len(result)} samples with chunk={chunk_size}, '
-        f'stride={stride}, bound={bound}')
+        # ensure enough space for the diagonal window
+        if i + chunk_size <= height:
+            subImage = np.zeros((chunk_size, chunk_size), dtype=np.float32)
+
+            # extract diagonal-centered local window
+            for j in range(chunk_size):
+                if i + j < height and i + j + chunk_size <= width:
+                    subImage[j] = mat[i + j, i + j:i + j + chunk_size]
+
+            subImage = torch.from_numpy(subImage.reshape(chunk_size * chunk_size))
+
+            # patch group name: diagonal index
+            sample = gi.create_group(f"{i}")
+
+            sample.create_dataset("img", data=subImage, compression="gzip")
+
+            # label format MUST stay consistent for downstream masking
+            strList = [cell_num, chr_num, size, i, i]
+            asciiList = [repr(n).encode("ascii", "ignore") for n in strList]
+            sample.create_dataset("label", data=asciiList)
+
 
 def res_change(length, res):
     """
@@ -67,7 +75,7 @@ def processor(args):
             for i in range(len(hic.getChromosomes())):
                 if ch == hic.getChromosomes()[i].name:
                     size = res_change(hic.getChromosomes()[i].length, resolution)
-            gen = hicstraw.straw('observed', 'NONE', cell_path_list[j], ch,ch,'BP', resolution)
+            gen = hicstraw.straw('observed', 'NONE', cell_path_list[j],ch,ch,'BP', resolution)
             A = np.zeros((size, size))
             for i in range(len(gen)):
                 p1 = gen[i].binX // resolution
@@ -78,9 +86,9 @@ def processor(args):
                     A[p2, p1] += val
             A = A.astype(np.float32)
             group_identity = cell_identity.create_group('{0}'.format(ch))
-            carn_divider(A, (cell_path_list[j].split("/")[-1]).split(".")[0], ch, group_identity, args.chunk, args.stride, args.bound, args.padding)
+            carn_divider(A, (cell_path_list[j].split("/")[-1]).split(".")[0], ch, group_identity, args.chunk, args.stride, args.padding)
     H5File.close()
-return None
+    return None
 
 def masking(args):
     """
@@ -91,16 +99,16 @@ def masking(args):
     H5File = h5py.File(save_path, 'r+')
     im = []
     def get_data_items(name, obj):
-        if len(name.split('/')) == 3:
-            if name.split('/')[2] == 'img':
-                if int((name.split('/')[1]).split('_')[0])>= int((name.split('/')[1]).split('_')[1]):
-                    im.append('/'.join(name.split('/')[:2]))
+        # name: chr/patch/img  (relative to the cell group)
+        if len(name.split('/')) == 3 and name.split('/')[2] == 'img':
+            im.append('/'.join(name.split('/')[:2]))   # chr/patch
 
-   for key in H5Dataset.keys():
+
+    for key in H5File.keys():
         key_sample = key
         break
-
-    H5Dataset[key_sample].visititems(get_data_items)
+    
+    H5File[key_sample].visititems(get_data_items)
 
     images = []
     cell_images = []
@@ -132,7 +140,46 @@ def masking(args):
             mask[mask == 0] = mask_ind
             H5File[key].create_dataset('mask', data = mask, compression="gzip")
     H5File.close()
-return None
+    return None
+
+def add_patchid(args):
+    """
+    Add one-hot encoded patch_id to each patch after masking.
+    """
+    save_path = args.outdir + '/h5_hic_dataset.hdf5'
+    h5_file = h5py.File(save_path, 'r+')
+
+    def calculate_total_patches(h5_file, example_cell):
+        total_patches = 0
+        for chromosome in h5_file[example_cell].keys():
+            total_patches += len(h5_file[example_cell][chromosome])
+        return total_patches
+
+    # use first cell to determine patch count
+    first_cell = next(iter(h5_file.keys()))
+    patch_count = calculate_total_patches(h5_file, first_cell)
+
+    # one-hot template
+    one_hot_template = np.eye(patch_count, dtype=np.float32)
+
+    for cell in tqdm(h5_file.keys(), desc="Adding patch_id"):
+        patch_index = 0
+        sorted_chromosomes = sorted(h5_file[cell].keys(), key=int)
+
+        for chromosome in sorted_chromosomes:
+            sorted_patches = sorted(h5_file[cell][chromosome].keys(), key=int)
+
+            for patch in sorted_patches:
+                one_hot_id = one_hot_template[patch_index]
+                patch_index += 1
+                grp = h5_file[cell][chromosome][patch]
+                if 'patch_id' in grp:
+                    del grp['patch_id']
+                grp.create_dataset('patch_id', data=one_hot_id, compression="gzip")
+
+    h5_file.close()
+    print("One-hot patch_id has been added to all patches.")
+
 
 if __name__ == "__main__":
     # parse command line arguments
@@ -162,7 +209,7 @@ if __name__ == "__main__":
         "--bound", type=int, default=201, help="bound size to split scHi-C"
     )
     parser.add_argument(
-        "--padding", action="store_true", default=True, help="whether padding when dividing scHi-C"
+        "--padding", action="store_true", default=False, help="whether padding when dividing scHi-C"
     )
     parser.add_argument(
         "--masking_ratio", type=float, default=0.6, help="masking ratio"
@@ -171,3 +218,4 @@ if __name__ == "__main__":
 
     processor(args)
     masking(args)
+    add_patchid(args)
