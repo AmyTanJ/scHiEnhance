@@ -1,295 +1,205 @@
 import argparse
 import os
-import torch
-from torch.utils.data import Dataset,DataLoader, IterableDataset
-import torch.nn as nn
-import numpy as np
-from itertools import cycle, islice
-from torch.distributions.utils import broadcast_all
-from torch.nn.functional import binary_cross_entropy_with_logits
-import skimage.transform as st
+import random
 import h5py
-import matplotlib.pyplot as plt
-import hicstraw
-from tqdm import tqdm
-import scanpy as sc
-import pyro
-import pyro.distributions as dist
-from pyro.infer import SVI, Trace_ELBO
-from pyro.optim import Adam
-
-pyro.distributions.enable_validation(False)
-pyro.set_rng_seed(0)
-# Enable smoke test - run the notebook cells on CI.
-smoke_test = 'CI' in os.environ
-
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import Normal
+from torch.utils.data import Dataset, DataLoader
+from scipy.sparse import csr_matrix
 from prefetch_generator import BackgroundGenerator
+from tqdm import tqdm
+
+
 class DataLoaderX(DataLoader):
     def __iter__(self):
         return BackgroundGenerator(super().__iter__())
 
-class DataSet(Dataset):
-    def __init__(self,fname, index):
-        self.dataset = fname
-        self.dataset_num = index
-    
-    def __len__(self):
-        return len(self.dataset_num)
-    
-    def __getitem__(self,idx):
-        sample = self.dataset[self.dataset_num[idx]]
-        label = []
-        for i in sample['label'][:]:
-            label.append(eval(i))
-        data = torch.from_numpy(sample['img'][:])
-        mask = torch.from_numpy(sample['mask'][:])
-        return data, label, mask
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def custom_sort(item):
+    sp = item.split("/")
+    a = int(sp[0])
+    b = int(sp[1]) if len(sp) > 1 and sp[1].isdigit() else 1e9
+    return a, b
+
 
 class Encoder(nn.Module):
-    def __init__(self, z_dim, hidden_dim):
+    def __init__(self, z_dim, hidden_dim, num_conditions):
         super().__init__()
-        # setup the three linear transformations used
-        self.fc1 = nn.Linear(200*200, 2000)
-        self.fc21 = nn.Linear(2000, z_dim)
-        self.fc22 = nn.Linear(2000, z_dim)
-        # setup the non-linearities
-        self.relu = nn.ReLU()
-        self.BN1 = nn.BatchNorm1d(2000)
+        self.z_dim = z_dim
+        self.net = nn.Sequential(
+            nn.Linear(200 * 200 + num_conditions, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.01),
+            nn.Linear(hidden_dim, z_dim * 2),
+        )
 
-    def forward(self, x):
-        x = self.relu(self.BN1(self.fc1(x)))
-        z_loc = self.fc21(x)
-        z_scale = torch.exp(self.fc22(x))
-        return z_loc, z_scale
+    def forward(self, x, cond):
+        h = self.net(torch.cat([x, cond], dim=1))
+        mu = h[:, :self.z_dim]
+        sigma = F.softplus(h[:, self.z_dim:]) + 1e-6
+        return mu, sigma
+
 
 class Decoder(nn.Module):
-    def __init__(self, z_dim, hidden_dim):
+    def __init__(self, z_dim, hidden_dim, num_conditions):
         super().__init__()
-        # setup the two linear transformations used
-        self.fc1 = nn.Linear(z_dim,2000)
-        self.fc2 = nn.Linear(2000, 200*200)
-        # setup the non-linearities
-        # self.softplus = nn.Softplus()
-        self.BN1 = nn.BatchNorm1d(2000)
-        self.relu = nn.ReLU()
-        self.Sigmoid = nn.Sigmoid()
+        self.net = nn.Sequential(
+            nn.Linear(z_dim + num_conditions, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.01),
+            nn.Linear(hidden_dim, 200 * 200),
+            nn.Sigmoid(),
+        )
 
-    def forward(self, z):
-        # define the forward computation on the latent z
-        # first compute the hidden units
-        x = self.relu(self.BN1(self.fc1(z)))
-        loc_img = self.Sigmoid(self.fc2(x))
-        return loc_img
+    def forward(self, z, cond):
+        return self.net(torch.cat([z, cond], dim=1))
 
-def train(svi, train_loader, use_cuda=True, getz = False):
-    # initialize loss accumulator
-    epoch_loss = 0.
-    # do a training epoch over each mini-batch x returned
-    # by the data loader
-    for x, index, m in train_loader:
-        # if on GPU put mini-batch into CUDA memory
-        # print("x")
-        if use_cuda:
-            x = x.cuda()
-            m = m.cuda()
-        # do ELBO gradient and accumulate loss
-        # print("x.cuda")
-        epoch_loss += svi.step(x, m)
-#         print(epoch_loss)
-
-    # return epoch loss
-    normalizer_train = len(train_loader.dataset)
-    total_epoch_loss_train = epoch_loss / normalizer_train
-    return total_epoch_loss_train
-
-def evaluate(svi, test_loader, use_cuda=True):
-    # initialize loss accumulator
-    test_loss = 0.
-    # do a training epoch over each mini-batch x returned
-    # by the data loader
-    for x, index, m in test_loader:
-        # if on GPU put mini-batch into CUDA memory
-        if use_cuda:
-            x = x.cuda()
-            m = m.cuda()
-        # do ELBO gradient and accumulate loss
-        test_loss += svi.evaluate_loss(x, m)
-
-    # return epoch loss
-    normalizer_test = len(test_loader.dataset)
-    total_epoch_loss_test = test_loss / normalizer_test
-    return total_epoch_loss_test
 
 class VAE(nn.Module):
-    def __init__(self, z_dim=16, hidden_dim=2000, use_cuda=True, patch_size = 200):
+    def __init__(self, z_dim, hidden_dim, num_conditions):
         super().__init__()
-        # create the encoder and decoder networks
-        self.encoder = Encoder(z_dim, hidden_dim)
-        self.decoder = Decoder(z_dim, hidden_dim)
-        
-        if use_cuda:
-            # calling cuda() here will put all the parameters of
-            # the encoder and decoder networks into gpu memory
-            self.cuda()
-        self.use_cuda = use_cuda
-        self.z_dim = z_dim
-        self.patch_size = patch_size
+        self.encoder = Encoder(z_dim, hidden_dim, num_conditions)
+        self.decoder = Decoder(z_dim, hidden_dim, num_conditions)
 
-    # define the model p(x|z)p(z)
-    def model(self, x, m):
-        # register PyTorch module `decoder` with Pyro
-        pyro.module("decoder", self.decoder)
-        with pyro.plate("data", x.shape[0]):
-            # setup hyperparameters for prior p(z)
-            z_loc = x.new_zeros(torch.Size((x.shape[0], self.z_dim)))
-            z_scale = x.new_ones(torch.Size((x.shape[0], self.z_dim)))
-            # sample from prior (value will be sampled by guide when computing the ELBO)
-            z = pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
-            # decode the latent code z
-            loc_img = self.decoder(z)
-            loc_img = loc_img.reshape(-1,self.patch_size*self.patch_size)
-            pyro.sample("obs", dist.Bernoulli(loc_img).mask(m).to_event(1), obs=x.reshape(-1, self.patch_size*self.patch_size))
-            
-    # define the guide (i.e. variational distribution) q(z|x)
-    def guide(self, x, m):
-        # register PyTorch module `encoder` with Pyro
-        pyro.module("encoder", self.encoder)
-        with pyro.plate("data", x.shape[0]):
-            # use the encoder to get the parameters used to define q(z|x)
-            z_loc, z_scale = self.encoder(x)
-            # sample the latent code z
-            pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
+def reconstruct_chromosome(
+    vae,
+    rx_h5,
+    input_h5,
+    output_h5_path,
+    key_list,
+    patch_ids,
+    rec_images,
+    size_list,
+    chosen_chr,
+    z_dim,
+    ab_dim,
+    device,
+):
+    vae.eval()
+    out_h5 = h5py.File(output_h5_path, "a")
 
-    # define a helper function for reconstructing images
-    def reconstruct_img(self, x):
-        # encode image x
-        z_loc, z_scale = self.encoder(x)
-        # sample in latent space
-        z = dist.Normal(z_loc, z_scale).sample()
-        # decode the image (note we don't sample in image space)
-        loc_img = self.decoder(z)
-        return loc_img
-    
-    def getZ(self, x):
-        # enczode image x
-        z_loc, z_scale = self.encoder(x)
-        return (z_loc,z_scale)
-    
-    def getRZ(self, z):
-        loc_img = self.decoder(z)
-        return loc_img
+    for key in tqdm(key_list):
+        rx = rx_h5[key][:-ab_dim]
+        rx = rx.reshape(-1, z_dim * 2)
 
-def getRX_list(key_sum, size_list, images, chr_num = 19):
-    """
-    Reconstruct imputed scHi-C contact maps.
-    """
-    n_AB_compart = np.load(args.AB_dir + 'scAB_compartment.npy', allow_pickle='TRUE').item()
-    c=list(n_AB_compart)
-    dim_AB_compart = n_AB_compart[c[0]].shape[1]
-    for key in tqdm(key_sum):
-        H5File = h5py.File(args.dir + '/poe_impu_rx.hdf5')
-        rx = H5File[key][:-dim_AB_compart]
-        H5File.close()
-        rx = rx.reshape(2429, 32)
-        rx = torch.from_numpy(rx[:,:16])
-        rxrx = vae.getRZ(rx.cuda())
-        rxrx = rxrx.cpu().detach().numpy()
-        for chro in range(1,chr_num+1):
-            H5Dataset = h5py.File(args.dir+'/h5_hic_dataset.hdf5')
-            rec_images = []
-            for ims in images:
-                if ims.split("/")[1] == str(chro):
-                    i, j = (ims.split("/")[2]).split("_")[0], (ims.split("/")[2]).split("_")[1]
-                    rec_images.append((eval(i), eval(j)))
-            width = eval(H5Dataset[key_sample][str(chro)]['0_0']['label'][:][2])
-            H5Dataset.close()
-            full_mat_rx = np.zeros((width, width))
-            test_num = size_list[chro-1]
-            test_mat = rxrx[test_num[0]:test_num[1]]
-            for p in range(len(test_mat)):
-                iw, jw = rec_images[p][0], rec_images[p][1]
-                sub_rx = test_mat[p].reshape(200, 200)
-                h, w = sub_rx.shape
-                if iw ==jw:
-                    full_mat_rx[iw:iw + h, jw:jw + w]+= sub_rx
-                else:
-                    full_mat_rx[iw:iw + h, jw:jw + w]+= sub_rx
-                    full_mat_rx[jw:jw + w, iw:iw + h] += sub_rx.T
-            mat_up = full_mat_rx-np.tril(full_mat_rx,-201)-np.triu(full_mat_rx,201)
-            H5F = h5py.File(args.dir + '/impu_rec.hdf5','a')
-            if key in H5F.keys():
-                H5F[key].create_dataset('{0}'.format(chro), data = mat_up, compression="gzip")
-            else:
-                group = H5F.create_group(key)
-                group.create_dataset('{0}'.format(chro), data = mat_up, compression="gzip")
-            H5File.close()
-    return None
+        mu = torch.from_numpy(rx[:, :z_dim]).float().to(device)
+        sigma = torch.from_numpy(rx[:, z_dim:]).float().to(device)
+        z = Normal(mu, sigma).rsample()
 
-def main(args):
-    H5Dataset = h5py.File(args.dir + '/h5_hic_dataset.hdf5')
+        with torch.no_grad():
+            rxrx = vae.decoder(z, patch_ids)
 
-    im = []
-    def get_data_items(name, obj):
-        if len(name.split('/')) == 3:
-            if name.split('/')[2] == 'img':
-                # print((name.split('/')[1]).split('_')[0], (name.split('/')[1]).split('_')[1])
-                if int((name.split('/')[1]).split('_')[0])>= int((name.split('/')[1]).split('_')[1]):
-                    im.append('/'.join(name.split('/')[:2]))
+        rxrx = rxrx.cpu().numpy()
 
-    for key in H5Dataset.keys():
-         key_sample = key
-         break
+        width = int(eval(input_h5[key][str(chosen_chr)]["0"]["label"][:][2]))
 
-    H5Dataset[key_sample].visititems(get_data_items)
+        full = np.zeros((width, width), dtype=np.float32)
+        count = np.zeros_like(full)
 
-    images = []
-    cell_images = []
-    for key in H5Dataset.keys():
-        cell_images.append(key)
-        for i_m in im:
-            cell_im = '/'.join([key, i_m])
-            images.append(cell_im)
+        idx_range = size_list[chosen_chr - 1]
+        patches = rxrx[idx_range[0] : idx_range[1]]
 
-    cellindex = []
-    for i in images:
-        cellindex.append(i.split('/')[0])
-    cellindex = np.unique(cellindex)
+        for p, patch in enumerate(patches):
+            iw = int(rec_images[p].split("/")[-1])
+            sub = patch.reshape(200, 200)
+            for i in range(200):
+                full[iw + i, iw + i : iw + i + 200] += sub[i]
+                count[iw + i, iw + i : iw + i + 200] += 1
 
-    celldata=DataSet(H5Dataset, images)
-    cell_loader=DataLoaderX(celldata, batch_size=6240, num_workers=4)
+        full = np.divide(full, count, out=np.zeros_like(full), where=count > 0)
 
-    # clear param store
-    pyro.clear_param_store()
-    vae = torch.load(args.dir + ’/patch_wise_VAE.save‘')
-    H5File = h5py.File(args.dir + '/poe_impu_rx.hdf5')
-    key_sum = []
-    for key in H5File.keys():
-        key_sum.append(key)
+        csr = csr_matrix(full)
+        grp = out_h5.create_group(key)
+        grp.create_dataset(f"{chosen_chr}/data", data=csr.data, compression="gzip")
+        grp.create_dataset(f"{chosen_chr}/indices", data=csr.indices, compression="gzip")
+        grp.create_dataset(f"{chosen_chr}/indptr", data=csr.indptr, compression="gzip")
+        grp.attrs["shape"] = full.shape
 
-    H5File.close()
-    H5Dataset.close()
+    out_h5.close()
 
-    size_list = [(0,193),(193,374),(374,533),(533,688),(688,837),(837,984),(984,1127),(1127,1254),(1254,1377),
-     (1377,1506),(1506,1627),(1627,1746),(1746,1865),(1865,1988),(1988,2091),(2091,2188),(2188,2281),
-     (2281,2370),(2370,2429)]
-
-    getRX_list(key_sum, size_list,rec_images)
-
-
-
-if __name__ == "__main__":
-    # parse command line arguments
-    parser = argparse.ArgumentParser(description="parse args")
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Patch-wise reconstruction to full Hi-C matrix"
+    )
     parser.add_argument(
         "--dir", type=str, required=True,
         help="root directory where both high resolution intrachromosomal Hi-C interaction matrices are stored"
     )
-    parser.add_argument(
-        "--cuda", action="store_true", default=True, help="whether to use cuda"
-    )
-    parser.add_argument(
-        "--num_workers", default=4, type=int, help="number of workers"
-    )
-    args = parser.parse_args()
 
-    mian(args)
+    parser.add_argument("--num_conditions", type=int, default=1266,
+                        help="Number of patches per chromosome")
+    parser.add_argument("--z_dim", type=int, default=16,
+                        help="Latent dimension")
+    parser.add_argument("--hidden_dim", type=int, default=2000,
+                        help="Hidden dimension")
+    parser.add_argument("--cuda", action="store_true", default=True,
+                        help="Use CUDA")
+
+    return parser.parse_args()
+
+
+def main(args):
+    set_seed(42)
+
+    device = torch.device(
+        "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
+    )
+
+    vae = torch.load(args.dir + '/finetuned_patch_wise_VAE.pth', map_location=device)
+
+    rx_h5 = h5py.File(args.dir + '/poe_impu_rx.hdf5', "r")
+    input_h5 = h5py.File(args.dir+'/h5_hic_dataset.hdf5', "r")
+
+    ab = np.load(args.AB_dir + 'scAB_compartment.npy')
+    ab_dim = ab.shape[1]
+
+    example = list(input_h5.keys())[0]
+    im_order = []
+    input_h5[example].visititems(
+        lambda n, o: im_order.append("/".join(n.split("/")[:2]))
+        if len(n.split("/")) == 3 and n.split("/")[-1] == "img" else None
+    )
+    im_order = sorted(set(im_order), key=custom_sort)
+
+    patch_ids = []
+    for im in im_order:
+        patch_ids.append(input_h5[example][im]["patch_id"][:])
+    patch_ids = torch.from_numpy(
+        np.asarray(patch_ids).reshape(args.num_conditions, args.num_conditions)
+    ).float().to(device)
+
+    size_list = [
+        (0, 101), (101, 195), (195, 278), (278, 359), (359, 437),
+        (437, 514), (514, 589), (589, 656), (656, 720), (720, 787),
+        (787, 850), (850, 912), (912, 974), (974, 1038), (1038, 1091),
+        (1091, 1141), (1141, 1189), (1189, 1235), (1235, 1266)
+    ]
+
+    keys = list(rx_h5.keys())
+
+    for chr_id in range(1, 19):
+        rec_images = [
+            im for im in im_order if im.split("/")[1] == str(chr_id)
+        ]
+        out_path = os.path.join(
+            args.dir, f"imputed_chr{chr_id}.hdf5"
+        )
+        reconstruct_chromosome(vae, rx_h5, input_h5, out_path, keys, patch_ids, rec_images, size_list, chr_id, args.z_dim, ab_dim, device)
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    main(args)
