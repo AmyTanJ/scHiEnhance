@@ -319,7 +319,7 @@ def main(args):
             print("Early stopping triggered.")
             break
 
-    torch.save(vae,cell_wise_model.pth")
+    torch.save(vae, os.path.join(args.dir, "cell_wise_model.pth"))
     
     # For clustering combined latent space
     getZ_list(args.dir)
