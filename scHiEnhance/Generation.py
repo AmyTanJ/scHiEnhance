@@ -201,18 +201,16 @@ def main(args):
         for x, key in tqdm(loader):
             x = x.to(device)
             mu, sigma = vae.encoder(x)
-
-            z = Normal(mu, sigma).sample()
-            with torch.no_grad():
-                rx = vae.decoder(z)
-
-            rx = rx.cpu().numpy()
-            z = z.cpu().numpy()
-
-            for i, k in enumerate(key):
-                grp = out_h5.create_group(f"{k}_{n}")
-                grp.create_dataset("rx", data=rx[i], compression="gzip")
-                grp.create_dataset("z", data=z[i], compression="gzip")
+            for j in range(args.num_generate):
+                z = Normal(mu, sigma).sample()
+                with torch.no_grad():
+                    rx = vae.decoder(z)
+                rx = rx.cpu().numpy()
+                z = z.cpu().numpy()
+                for i, k in enumerate(key):
+                    grp = out_h5.create_group(f"{k}_{n}")
+                    grp.create_dataset("rx", data=rx[i], compression="gzip")
+                    grp.create_dataset("z", data=z[i], compression="gzip")
 
         out_h5.close()
 
