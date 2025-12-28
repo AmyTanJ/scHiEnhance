@@ -32,7 +32,7 @@ Under output directory:
 
 * Path/to/outdir/
    * h5_hic_dataset.h5py: A file includes all patches information.
-   * patch_wise_VAE.save: A file storing patch-wise VAE model.
+   * patch_wise_VAE.pth: A file storing patch-wise VAE model.
    * patch_wise_features.hdf5: A file including patch-wise representations and A/B compartment profile.
    * poe_z.hdf5: A file including cell-wise representations.
    * poe_impu_rx.hdf5: A file including reconstructed patch-wise representations from POE framework.
