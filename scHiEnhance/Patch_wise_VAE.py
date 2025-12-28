@@ -15,7 +15,6 @@ class DataLoaderX(DataLoader):
     def __iter__(self):
         return BackgroundGenerator(super().__iter__())
 
-
 def set_seed(seed=42):
     """
     Fix random seeds for reproducibility.
@@ -27,11 +26,6 @@ def set_seed(seed=42):
     os.environ["PYTHONHASHSEED"] = str(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
-
-# =========================
-# Dataset
-# =========================
 
 class DataSet(Dataset):
     def __init__(self, h5file, index, num_conditions):
